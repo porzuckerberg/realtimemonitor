@@ -5,11 +5,9 @@ import json
 
 app = FastAPI()
 
-# เก็บรายชื่อเครื่องบอทที่ออนไลน์ และคนที่กำลังเปิดเว็บดูอยู่
 connected_bots = {}
 web_monitors = []
 
-# โค้ดหน้าเว็บ HTML + JavaScript แบบฝังในตัว
 html_content = """
 <!DOCTYPE html>
 <html>
@@ -17,9 +15,10 @@ html_content = """
     <title>Bot Monitor Dashboard</title>
     <style>
         body { font-family: Arial; text-align: center; background: #222; color: white; }
-        select, button { padding: 10px; font-size: 16px; margin: 10px; cursor: pointer; }
-        #monitor { max-width: 90%; max-height: 70vh; border: 2px solid #555; background: #000; }
-        .controls { margin-bottom: 20px; }
+        select, button, input { padding: 8px; font-size: 16px; margin: 5px; cursor: pointer; border-radius: 5px; }
+        #monitor { max-width: 90%; max-height: 70vh; border: 2px solid #555; background: #000; margin-top: 10px; }
+        .controls { margin-bottom: 20px; background: #333; padding: 15px; border-radius: 10px; display: inline-block; }
+        label { font-size: 16px; margin-left: 10px; }
     </style>
 </head>
 <body>
@@ -28,12 +27,22 @@ html_content = """
         <select id="botSelect">
             <option value="">-- เลือกเครื่องบอท --</option>
         </select>
+        
+        <select id="monitorSelect">
+            <option value="1">จอหลัก (Monitor 1)</option>
+            <option value="2">จอรอง (Monitor 2)</option>
+            <option value="0">ดูรวมทุกจอ</option>
+        </select>
+
+        <label for="fpsInput">FPS:</label>
+        <input type="number" id="fpsInput" value="2" min="1" max="30" style="width: 60px;">
+
         <button id="playBtn" onclick="togglePlay()">เริ่มดูจอ</button>
     </div>
+    <br>
     <img id="monitor" src="" alt="ภาพหน้าจอจะแสดงที่นี่" />
 
     <script>
-        // เปลี่ยนจาก http เป็น ws หรือ wss อัตโนมัติ
         let protocol = window.location.protocol === "https:" ? "wss" : "ws";
         let ws = new WebSocket(protocol + "://" + window.location.host + "/ws");
         
@@ -41,11 +50,10 @@ html_content = """
         let requestInterval;
 
         ws.onopen = function() {
-            ws.send("MONITOR"); // บอกเซิร์ฟเวอร์ว่าฉันคือคนดูเว็บ
+            ws.send("MONITOR");
         };
 
         ws.onmessage = function(event) {
-            // ถ้ารับข้อความมาเป็น String (อัปเดตรายชื่อเครื่องบอท)
             if (typeof event.data === "string") {
                 let data = JSON.parse(event.data);
                 if (data.type === "bot_list") {
@@ -57,15 +65,34 @@ html_content = """
                     });
                     select.value = currentVal;
                 }
-            } 
-            // ถ้ารับมาเป็นก้อนข้อมูล (รูปภาพหน้าจอ)
-            else {
+            } else {
                 let url = URL.createObjectURL(event.data);
                 let img = document.getElementById("monitor");
                 img.src = url;
-                img.onload = () => URL.revokeObjectURL(url); // คืนพื้นที่แรม
+                img.onload = () => URL.revokeObjectURL(url);
             }
         };
+
+        // ฟังก์ชันคำนวณและเริ่มการขอภาพตาม FPS ที่ตั้งไว้
+        function startInterval() {
+            let targetBot = document.getElementById("botSelect").value;
+            let targetScreen = document.getElementById("monitorSelect").value;
+            let fps = parseInt(document.getElementById("fpsInput").value) || 2;
+            
+            // จำกัดไม่ให้กรอก FPS มั่ว
+            if (fps < 1) fps = 1;
+            if (fps > 30) fps = 30;
+            
+            let delay = 1000 / fps; // แปลง FPS เป็นมิลลิวินาที
+
+            requestInterval = setInterval(() => {
+                ws.send(JSON.stringify({
+                    action: "request_frame", 
+                    target: targetBot,
+                    screen: targetScreen 
+                }));
+            }, delay);
+        }
 
         function togglePlay() {
             let targetBot = document.getElementById("botSelect").value;
@@ -80,16 +107,29 @@ html_content = """
             if (isPlaying) {
                 btn.innerText = "หยุด (Pause)";
                 btn.style.color = "red";
-                // ส่งคำสั่งขอภาพรัวๆ ทุก 0.5 วินาที
-                requestInterval = setInterval(() => {
-                    ws.send(JSON.stringify({action: "request_frame", target: targetBot}));
-                }, 500);
+                startInterval();
             } else {
                 btn.innerText = "เริ่มดูจอ";
                 btn.style.color = "black";
                 clearInterval(requestInterval);
             }
         }
+
+        // ทำให้เมื่อเปลี่ยนตัวเลข FPS จะมีผลทันทีโดยไม่ต้องกดปุ่มหยุด/เริ่มใหม่
+        document.getElementById("fpsInput").addEventListener("change", function() {
+            if (isPlaying) {
+                clearInterval(requestInterval);
+                startInterval();
+            }
+        });
+        
+        // ทำให้เมื่อเปลี่ยนจอ จะมีผลทันทีเช่นกัน
+        document.getElementById("monitorSelect").addEventListener("change", function() {
+            if (isPlaying) {
+                clearInterval(requestInterval);
+                startInterval();
+            }
+        });
     </script>
 </body>
 </html>
@@ -104,34 +144,30 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     bot_name = None
     try:
-        # รอรับการยืนยันตัวตนว่าใครเชื่อมต่อเข้ามา
         auth_msg = await websocket.receive_text()
         
         if auth_msg.startswith("BOT:"):
-            # ถ้าเป็นเครื่องบอท
             bot_name = auth_msg.split(":")[1]
             connected_bots[bot_name] = websocket
-            await update_monitors() # อัปเดต Dropdown หน้าเว็บ
+            await update_monitors()
             
             while True:
-                # รอรับรูปจากบอท แล้วส่งต่อให้คนดูเว็บทุกคน
                 data = await websocket.receive_bytes()
                 for monitor in web_monitors:
                     await monitor.send_bytes(data)
 
         elif auth_msg == "MONITOR":
-            # ถ้าเป็นคนเปิดหน้าเว็บ
             web_monitors.append(websocket)
             await websocket.send_text(json.dumps({"type": "bot_list", "bots": list(connected_bots.keys())}))
             
             while True:
-                # รอรับคำสั่งจากเว็บ ว่าอยากดูภาพของเครื่องไหน
                 msg = await websocket.receive_text()
                 data = json.loads(msg)
                 if data["action"] == "request_frame":
                     target = data["target"]
+                    screen = data["screen"]
                     if target in connected_bots:
-                        await connected_bots[target].send_text("GET_FRAME")
+                        await connected_bots[target].send_text(f"GET_FRAME:{screen}")
                         
     except WebSocketDisconnect:
         if bot_name in connected_bots:
@@ -141,7 +177,6 @@ async def websocket_endpoint(websocket: WebSocket):
             web_monitors.remove(websocket)
 
 async def update_monitors():
-    # ส่งรายชื่อเครื่องคอมที่เปิดโปรแกรมอยู่ไปอัปเดตหน้าเว็บ
     bot_list = json.dumps({"type": "bot_list", "bots": list(connected_bots.keys())})
     for monitor in web_monitors:
         try:
